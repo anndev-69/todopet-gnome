@@ -3,6 +3,7 @@
 // Pango and core/, so tests and tools/snapshot.js can load it outside GNOME Shell, and an St.DrawingArea can call
 // drawPet(cr, width, height, pose) or drawSign(cr, width, height, text) on repaint.
 import Cairo from 'cairo';
+import Gio from 'gi://Gio';
 import Pango from 'gi://Pango';
 import PangoCairo from 'gi://PangoCairo';
 
@@ -495,7 +496,8 @@ const EAR_LIFT = Object.freeze({
 });
 
 function drawFeet(cr, f) {
-    const {p, mood, pal, cx, by} = f, t = p.t;
+    const {p, mood, cx, by} = f, t = p.t;
+    const pal = f.limbPal ?? f.pal;
     let liftL = 0, liftR = 0;
     if (p.walking && !p.held) {
         liftL = Math.max(0, Math.sin(p.walkPhase)) * 5;
@@ -533,6 +535,409 @@ function drawEars(cr, f) {
         const inward = q => [c[0] + (q[0] - c[0]) * 0.5, c[1] + (q[1] - c[1]) * 0.5 + 2];
         fill(cr, new Path().moveTo(...inward(b1)).lineTo(...inward(tip)).lineTo(...inward(b2)).close(), INNER_EAR);
     }
+}
+
+// Custom pet: a round photo of the head instead of Mochi's body, ears, face and cheeks (art/photo.png). Mood shows as
+// a colored ring and tint; falls back to the drawn pet when the file can't be loaded.
+let photoSurface;
+function loadPhoto() {
+    if (photoSurface === undefined) {
+        try {
+            photoSurface = Cairo.ImageSurface.createFromPNG(Gio.File.new_for_uri(import.meta.url).get_parent().get_child('photo.png').get_path());
+        } catch (e) {
+            photoSurface = null;
+        }
+    }
+    return photoSurface;
+}
+
+// --- Sticker pet: one full-body sticker per state (art/sprites/*.png) ---
+
+const SPRITES = ['idle', 'walk', 'run', 'cheer', 'jump', 'sit', 'sleep', 'angry', 'guns', 'wave', 'laptop', 'check'];
+// Stickers drawn facing right, mirrored when the pet walks left.
+const DIRECTIONAL = new Set(['walk', 'run', 'angry', 'jump']);
+// Where the head is in each sticker, as fractions of its box: [center x, eye line y, cap top y]. Hats, glasses,
+// the bow and the sprouts are placed from these, so they follow the head from pose to pose.
+const HEADS = {
+    idle: [0.45, 0.28, 0.0], walk: [0.45, 0.28, 0.0], run: [0.68, 0.30, 0.0], cheer: [0.47, 0.24, 0.0],
+    jump: [0.38, 0.27, 0.0], sit: [0.43, 0.27, 0.0], sleep: [0.30, 0.45, 0.12], angry: [0.42, 0.27, 0.0],
+    guns: [0.32, 0.29, 0.0], wave: [0.33, 0.28, 0.0], laptop: [0.45, 0.27, 0.0], check: [0.28, 0.30, 0.0],
+};
+// Stickers that already show their own Zz or anger mark: skip the drawn ones.
+const OWN_EFFECTS = new Set(['sleep', 'angry']);
+let spriteSurfaces;
+
+function loadSprites() {
+    if (spriteSurfaces === undefined) {
+        spriteSurfaces = null;
+        try {
+            const dir = Gio.File.new_for_uri(import.meta.url).get_parent().get_child('sprites');
+            const map = new Map();
+            for (const name of SPRITES)
+                map.set(name, Cairo.ImageSurface.createFromPNG(dir.get_child(`${name}.png`).get_path()));
+            spriteSurfaces = map;
+        } catch (e) {
+            spriteSurfaces = null;
+        }
+    }
+    return spriteSurfaces;
+}
+
+// The sticker for this frame. Celebrations alternate two stickers on the beat, like a two-frame meme loop.
+function spriteName(p, mood) {
+    if (p.held)
+        return 'jump';
+    if (p.walking) {
+        if (mood === Mood.angry)
+            return 'angry';
+        return mood === Mood.celebrating ? 'jump' : 'walk';
+    }
+    switch (mood) {
+    case Mood.sleeping:
+        return 'sleep';
+    case Mood.angry:
+        return 'angry';
+    case Mood.annoyed:
+        return 'sit';
+    case Mood.focus:
+        return 'laptop';
+    case Mood.celebrating:
+        if (p.celebration === 'dance')
+            return 'guns';
+        return Math.floor(p.t * 2.2) % 2 === 0 ? 'cheer' : 'jump';
+    case Mood.happy:
+        return p.hovered ? 'wave' : 'check';
+    default:
+        return p.hovered ? 'wave' : 'idle';
+    }
+}
+
+// Motion on top of the body's jump and squash, anchored at the feet: [dx, rotation, extra squash].
+function spriteMotion(p, mood, name) {
+    const t = p.t;
+    const k = p.calm ? 0.35 : 1;
+    switch (name) {
+    case 'walk':
+    case 'run':
+        // Waddle: lean into each step, and a squash where a foot lands.
+        return [0, 0.07 * Math.sin(p.walkPhase) * k, 0.05 * Math.max(0, Math.cos(p.walkPhase * 2)) * k];
+    case 'cheer':
+    case 'jump': {
+        const ph = (t * 2.2) % 1;
+        return [0, 0.10 * Math.sin(Math.PI * 2 * t * 1.1) * k, 0.10 * springPulse(ph, 6, 13) * k];
+    }
+    case 'guns':
+        return [Math.sin(t * 8) * 3 * k, 0.12 * Math.sin(t * 8) * k, 0];
+    case 'angry': {
+        // Stomp: a fast squash on each stomp, a tremor in between.
+        const ph = (t * 1.6) % 1;
+        const hit = ph < 0.06 ? ph / 0.06 : Math.exp(-9 * (ph - 0.06));
+        return [Math.sin(t * 57) * (0.6 + 1.4 * hit) * k, Math.sin(t * 31) * 0.02 * k, 0.09 * hit * k];
+    }
+    case 'check':
+        return [0, 0.04 * Math.sin(t * 2.2) * k, 0.04 * springPulse((t * 1.1) % 1, 7, 12) * k];
+    case 'wave':
+        return [0, 0.05 * Math.sin(t * 6) * k, 0];
+    case 'sit':
+        return [0, 0.03 * Math.sin(t * 0.8) * k, 0.02 * Math.sin(t * 0.8) * k];
+    case 'sleep':
+        return [0, 0, -0.025 * Math.sin(t * 1.3)];
+    case 'laptop':
+        return [0, 0, 0.01 * Math.sin(t * 1.7)];
+    default:
+        return [0, 0.025 * Math.sin(t * 0.9) * k, 0.015 * Math.sin(t * 1.7) * k];
+    }
+}
+
+// Draws the sticker pet, then the shared effects (confetti, sweat, treats, flies) around it. Returns false when the
+// stickers can't be loaded, so the caller draws something else.
+function drawSpritePet(cr, f, moves) {
+    const sprites = loadSprites();
+    if (!sprites)
+        return false;
+    const {p, mood, pal} = f;
+    const name = spriteName(p, mood);
+    const img = sprites.get(name);
+    const iw = img.getWidth(), ih = img.getHeight();
+    const scale = Math.min(102 / ih, 112 / iw);
+    const w = iw * scale, h = ih * scale;
+    const [mdx, mrot, msq] = spriteMotion(p, mood, name);
+    const squash = moves.squash + msq;
+    const thin = p.hungry && mood !== Mood.celebrating ? 0.9 : 1;
+    const footX = f.cx + mdx;
+    const footY = 113 - moves.jump - (name === 'sleep' ? 4 : 1);
+    const flip = DIRECTIONAL.has(name) && p.facing < 0 ? -1 : 1;
+
+    cr.save();
+    try {
+        if (moves.spinX !== 1 || moves.flipAngle !== 0) {
+            const midY = footY - h / 2;
+            cr.translate(footX, midY);
+            if (moves.flipAngle !== 0)
+                cr.rotate(moves.flipAngle * -p.facing);
+            if (moves.spinX !== 1)
+                cr.scale(Math.max(Math.abs(moves.spinX), 0.12) * (moves.spinX < 0 ? -1 : 1), 1);
+            cr.translate(-footX, -midY);
+        }
+        cr.translate(footX, footY);
+        cr.rotate(mrot);
+        cr.scale((1 + squash) * flip * thin, (1 - squash) * (1 + moves.breathe));
+        cr.translate(-w / 2, -h);
+        // From here the sticker fills (0, 0)–(w, h).
+        const golden = p.golden && mood === Mood.celebrating;
+        const grimy = p.dirt > 0 && mood !== Mood.celebrating;
+        cr.pushGroup();
+        cr.save();
+        cr.scale(scale, scale);
+        cr.setSourceSurface(img, 0, 0);
+        cr.paint();
+        cr.restore();
+        // Gold and smudges land on the sticker only: ATOP keeps its transparent parts transparent.
+        cr.setOperator(Cairo.Operator.ATOP);
+        if (golden) {
+            setColor(cr, withAlpha(pal.bottom, 0.85));
+            cr.paint();
+        }
+        if (grimy)
+            drawDirt(cr, {p, cx: w / 2, by: h, bw: w * 0.9, bh: h * 0.8, body: new Path().rect(0, 0, w, h)});
+        cr.popGroupToSource();
+        cr.paint();
+
+        const [hxf, eyf, capf] = HEADS[name];
+        const hx = hxf * w, capTop = capf * h, headW = 0.42 * h;
+        const head = {
+            p, mood, pal, cx: hx, fx: hx, top: capTop, bw: headW, bh: headW,
+            ey: eyf * h, ex: Math.max(7.5, 0.075 * h),
+            by: (eyf + 0.34) * h, body: new Path().rect(0, 0, w, h),
+        };
+        if (p.sprouts > 0)
+            drawSprouts(cr, head);
+        drawAccessories(cr, head);
+    } finally {
+        cr.restore();
+    }
+
+    // Effects use the sticker's box: the head is in its upper third, the mouth about a quarter down.
+    const top = footY - h;
+    const e = {...f, cx: footX, top, bw: w * 0.75, bh: h * 0.6, by: footY, fx: footX, ey: top + h * 0.2, my: top + h * 0.27};
+    if (!OWN_EFFECTS.has(name))
+        drawEffects(cr, e);
+    if (p.dirt >= 2 && mood !== Mood.celebrating)
+        drawFlies(cr, e);
+    if (p.hungry && mood !== Mood.celebrating && mood !== Mood.sleeping && Math.sin(p.t * 1.6) > 0.3)
+        drawRumble(cr, e);
+    if (p.food && p.foodT < 1.6)
+        drawFood(cr, e);
+    return true;
+}
+
+const LEATHER = {top: rgba(0x3A3B42), bottom: rgba(0x1B1C21), line: rgba(0x0B0B0E), cheek: rgba(0, 0)};
+
+// Black-leather limbs for the photo pet, a little tinted by the mood.
+function leatherPalette(pal) {
+    return Object.freeze({
+        top: mixRGBA(LEATHER.top, pal.bottom, 0.18), bottom: mixRGBA(LEATHER.bottom, pal.bottom, 0.18),
+        line: LEATHER.line, cheek: LEATHER.cheek,
+    });
+}
+
+// Small leather-jacket torso under the head, with the zip and the collar.
+function drawPhotoTorso(cr, f) {
+    const {pal, cx, top, by, bw} = f;
+    const w = 40 * (bw / 72);
+    const y0 = top + 20, y1 = by - 3;
+    const body = bodyPath(cx, y0, y1, w, y1 - y0);
+    const g = new Cairo.LinearGradient(cx, y0, cx, y1);
+    const lp = leatherPalette(pal);
+    g.addColorStopRGBA(0, lp.top.r, lp.top.g, lp.top.b, 1);
+    g.addColorStopRGBA(1, lp.bottom.r, lp.bottom.g, lp.bottom.b, 1);
+    body.apply(cr);
+    cr.setSource(g);
+    cr.fill();
+    stroke(cr, body, LEATHER.line, 2);
+    stroke(cr, line(cx, y0 + 12, cx, y1 - 1), rgba(0xC9CCD4, 0.85), 1.2);
+    fill(cr, ellipse(cx - w * 0.30, y0 + 10, w * 0.16, 7), withAlpha(WHITE, 0.16));
+}
+
+// A damped spring pulse: 1 at ph = 0, overshoots and settles (ph in 0..1 within one beat).
+const springPulse = (ph, decay, freq) => Math.exp(-decay * ph) * Math.cos(freq * ph);
+
+// Motion of the photo head, as a pose [dx, dy, rotation, scaleX, scaleY] around its center. Every mood has its own
+// body language, and the beats follow the celebration's rhythm. While you type or focus (p.calm) everything gets
+// gentler (about a third) instead of switching off.
+function photoMotion(p, mood) {
+    const t = p.t;
+    const k = p.calm ? 0.35 : 1;
+    let dx = 0, dy = 0, rot = 0, sx = 1, sy = 1;
+    const beat = (t * 2.2) % 1;
+    switch (mood) {
+    case Mood.celebrating: {
+        // Head-bob on the beat: squash on the hit, springy overshoot, tilt alternating left and right.
+        const pulse = springPulse(beat, 6, 13);
+        sx = 1 + 0.13 * pulse;
+        sy = 1 - 0.10 * pulse;
+        rot = 0.18 * Math.sin(Math.PI * 2 * t * 1.1);
+        dy = -2.5 * Math.abs(Math.sin(Math.PI * beat));
+        break;
+    }
+    case Mood.happy: {
+        const pulse = springPulse(beat, 7, 12);
+        sx = 1 + 0.06 * pulse;
+        sy = 1 - 0.05 * pulse;
+        rot = 0.08 * Math.sin(Math.PI * 2 * t * 1.1);
+        break;
+    }
+    case Mood.angry: {
+        // Zoom punch: a fast snap in, then a slow settle, with a tremor on top.
+        const ph = (t * 1.1) % 1;
+        const a = ph < 0.06 ? ph / 0.06 : Math.exp(-9 * (ph - 0.06));
+        sx = sy = 1 + 0.12 * a;
+        dx = Math.sin(t * 57) * (0.7 + 1.5 * a);
+        dy = Math.cos(t * 49) * 0.5 * a;
+        rot = Math.sin(t * 31) * 0.02 * (0.5 + a);
+        break;
+    }
+    case Mood.annoyed:
+        // Head sunk and tilted, slowly rocking as if sighing.
+        rot = 0.08 + 0.035 * Math.sin(t * 0.8);
+        dy = 1.5 + 0.8 * Math.sin(t * 0.8);
+        break;
+    case Mood.sleeping:
+        // Drooping head, breathing slowly. The only mood that ignores calm: it is already still.
+        return [0, 1.5 + 0.6 * Math.sin(t * 1.3), 0.17 + 0.02 * Math.sin(t * 1.3), 1, 1 + 0.018 * Math.sin(t * 1.3)];
+    default:
+        // Alive at rest: a slow sway and a breath.
+        rot = 0.03 * Math.sin(t * 0.9);
+        sy = 1 + 0.014 * Math.sin(t * 1.7);
+    }
+    if (p.walking && !p.held) {
+        // Waddle: tilt with every step, a small hop between steps.
+        rot += 0.09 * Math.sin(p.walkPhase) * p.facing;
+        dy -= Math.abs(Math.sin(p.walkPhase)) * 2.4;
+    }
+    if (p.hovered && (mood === Mood.normal || mood === Mood.happy)) {
+        const w = Math.sin(t * 7);
+        sx *= 1.05 + 0.02 * w;
+        sy *= 0.94 - 0.02 * w;
+    }
+    return [dx * k, dy * k, rot * k, 1 + (sx - 1) * k, 1 + (sy - 1) * k];
+}
+
+// Ease-out bounce, 0 → 1 (the "deal with it" shades landing).
+function bounceOut(x) {
+    const n = 7.5625, d = 2.75;
+    if (x < 1 / d)
+        return n * x * x;
+    if (x < 2 / d)
+        return n * (x -= 1.5 / d) * x + 0.75;
+    if (x < 2.5 / d)
+        return n * (x -= 2.25 / d) * x + 0.9375;
+    return n * (x -= 2.625 / d) * x + 0.984375;
+}
+
+// Pixel "deal with it" shades that drop onto the face while celebrating.
+function drawDealWithIt(cr, p) {
+    const prog = p.food ? clamp01(p.foodT / 0.7) : 1;
+    const y = -64 * (1 - bounceOut(prog)) - 9;
+    const px = 2.2;
+    const black = rgba(0x050505);
+    const rows = [
+        '..#########..#########..',
+        '.###########.###########.',
+        '.###########.###########.',
+        '..#########..#########..',
+        '...#######....#######...',
+    ];
+    const x0 = -(rows[1].length * px) / 2;
+    cr.save();
+    setColor(cr, black);
+    rows.forEach((row, ry) => {
+        for (let rx = 0; rx < row.length; rx++) {
+            if (row[rx] === '#')
+                cr.rectangle(x0 + rx * px, y + ry * px, px + 0.2, px + 0.2);
+        }
+    });
+    cr.fill();
+    // A glint sweeps across the lenses just after they land.
+    if (p.food && p.foodT > 0.7 && p.foodT < 1.15) {
+        const sweep = x0 + (p.foodT - 0.7) / 0.45 * rows[1].length * px;
+        setColor(cr, withAlpha(WHITE, 0.9));
+        rows.forEach((row, ry) => {
+            for (let rx = 0; rx < row.length; rx++) {
+                const x = x0 + rx * px;
+                if (row[rx] === '#' && Math.abs(x + ry * px * 0.5 - sweep) < px * 1.6)
+                    cr.rectangle(x, y + ry * px, px + 0.2, px + 0.2);
+            }
+        });
+        cr.fill();
+        setColor(cr, black);
+    }
+    setColor(cr, withAlpha(WHITE, 0.55));
+    cr.rectangle(x0 + 2 * px, y + px, 4 * px, px * 0.8);
+    cr.rectangle(x0 + 13 * px, y + px, 4 * px, px * 0.8);
+    cr.fill();
+    cr.restore();
+}
+
+function drawPhotoHead(cr, f) {
+    const img = loadPhoto();
+    if (!img)
+        return false;
+    const {pal, cx, top, bh, bw, mood} = f;
+    const r = 29;
+    drawPhotoTorso(cr, f);
+    cr.save();
+    cr.translate(cx, top + bh * 0.40);
+    cr.scale(bw / 72, bh / 60);
+    const [mx, my, mrot, msx, msy] = photoMotion(f.p, mood);
+    cr.translate(mx, my);
+    cr.rotate(mrot);
+    cr.scale(msx, msy);
+    const circle = () => cr.arc(0, 0, r, 0, 2 * Math.PI);
+    // Soft glow in the mood color behind the head.
+    const glow = new Cairo.RadialGradient(0, 0, r - 2, 0, 0, r + 9);
+    glow.addColorStopRGBA(0, pal.bottom.r, pal.bottom.g, pal.bottom.b, 0.55);
+    glow.addColorStopRGBA(1, pal.bottom.r, pal.bottom.g, pal.bottom.b, 0);
+    cr.arc(0, 0, r + 9, 0, 2 * Math.PI);
+    cr.setSource(glow);
+    cr.fill();
+    cr.save();
+    circle();
+    cr.clip();
+    cr.translate(-r, -r);
+    cr.scale(2 * r / img.getWidth(), 2 * r / img.getHeight());
+    cr.setSourceSurface(img, 0, 0);
+    cr.paint();
+    cr.restore();
+    const golden = f.p.golden && mood === Mood.celebrating;
+    if (golden || mood === Mood.angry || mood === Mood.annoyed || mood === Mood.sleeping) {
+        circle();
+        setColor(cr, withAlpha(pal.bottom, golden ? 0.86 : mood === Mood.angry ? 0.45 : 0.3));
+        cr.fill();
+    }
+    if (mood === Mood.celebrating)
+        drawDealWithIt(cr, f.p);
+    // Glossy highlight in the upper left, like a glass badge.
+    cr.save();
+    circle();
+    cr.clip();
+    cr.translate(-r * 0.38, -r * 0.55);
+    cr.scale(1, 0.55);
+    cr.arc(0, 0, r * 0.62, 0, 2 * Math.PI);
+    setColor(cr, withAlpha(WHITE, 0.16));
+    cr.fill();
+    cr.restore();
+    // Colored ring with a thin dark edge on both sides.
+    circle();
+    setColor(cr, pal.bottom);
+    cr.setLineWidth(3.6);
+    cr.stroke();
+    cr.arc(0, 0, r + 1.9, 0, 2 * Math.PI);
+    setColor(cr, withAlpha(pal.line, 0.9));
+    cr.setLineWidth(1);
+    cr.stroke();
+    cr.restore();
+    return true;
 }
 
 function drawBody(cr, f) {
@@ -685,7 +1090,8 @@ function drawMouth(cr, f) {
 }
 
 function drawArms(cr, f) {
-    const {p, mood, pal, cx, top, by, bw, bh} = f, t = p.t;
+    const {p, mood, cx, top, by, bw, bh} = f, t = p.t;
+    const pal = f.limbPal ?? f.pal;
     const armFill = mixRGBA(pal.top, pal.bottom, 0.6);
     const arm = (x, y, angle, w = 11, h = 16) => {
         const e = ellipse(-w / 2, -h / 2, w, h).rotated(angle, x, y);
@@ -1149,6 +1555,10 @@ function drawFrame(cr, p) {
         petted: p.hovered && (mood === Mood.normal || mood === Mood.happy),
         body: bodyPath(cx, top, by, bw, bh),
     };
+    if (drawSpritePet(cr, f, {jump, squash, breathe, spinX, flipAngle}))
+        return;
+    if (loadPhoto())
+        f.limbPal = leatherPalette(pal);
 
     // Spins and back-flips turn the whole body around its middle; effects drawn after restore() stay put.
     cr.save();
@@ -1163,13 +1573,18 @@ function drawFrame(cr, p) {
             cr.translate(-cx, -midY);
         }
         drawFeet(cr, f);
-        drawEars(cr, f);
-        drawBody(cr, f);
-        if (mood === Mood.focus)
-            drawHeadband(cr, f);
-        drawCheeks(cr, f);
-        drawEyes(cr, f);
-        drawMouth(cr, f);
+        if (drawPhotoHead(cr, f)) {
+            if (mood === Mood.focus)
+                drawHeadband(cr, f);
+        } else {
+            drawEars(cr, f);
+            drawBody(cr, f);
+            if (mood === Mood.focus)
+                drawHeadband(cr, f);
+            drawCheeks(cr, f);
+            drawEyes(cr, f);
+            drawMouth(cr, f);
+        }
         drawArms(cr, f);
         if (p.sprouts > 0)
             drawSprouts(cr, f);
@@ -1316,6 +1731,8 @@ let signCache = null;
 // paths and Pango layouts, and a module outlives disable(): App.stop() calls this so nothing stays behind.
 export function clearArtCaches() {
     glyphs.clear();
+    photoSurface = undefined;
+    spriteSurfaces = undefined;
     emojiLayouts.clear();
     signCache = null;
 }
